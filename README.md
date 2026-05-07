@@ -104,6 +104,11 @@ idle_reset_ms = 800        # drop the word buffer after this long with no typing
 en = "/usr/share/hunspell/en_US-large.dic"
 ru = "$HOME/.local/share/swtchr/dicts/ru_top200k.txt"
 extra_words = ["systemd", "tmux", "swtchr", "hyprland"]
+
+[detector]
+retro_window_ms = 1500     # how long preceding short tokens (1–2 chars) stay
+                           # eligible to be retro-fixed when a later word
+                           # triggers a swap. Raise it if you type slowly.
 ```
 
 Reload by restarting the unit.
@@ -132,7 +137,10 @@ Reload by restarting the unit.
    layout. Modifier state is tracked separately for the word buffer.
 3. On a word boundary, the **detector** asks: "is this word in the current
    layout's dictionary? if not, would it be a valid word in the other
-   layout's dictionary?" If yes-then-no — switch and retype.
+   layout's dictionary?" If yes-then-no — switch and retype. Recently-typed
+   short tokens (1–2 chars) are stashed in a queue and retro-fixed in the
+   same sweep when a following word triggers a swap, so phrase-opening
+   function words like "а ты ..." don't stay orphaned in the wrong layout.
 4. **Replay**: backspace the wrong word + boundary char, dispatch
    `hyprctl switchxkblayout current next`, wait briefly for the new layout
    to take effect, replay the *same evdev keycodes* (which now produce the
