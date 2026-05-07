@@ -1,0 +1,33 @@
+# swtchr config — drop into ~/.config/swtchr/config.toml
+# All sections are optional; defaults are baked in.
+
+[general]
+quiet_ms = 25
+idle_reset_ms = 800
+default_layout = "us,ru"  # fallback if Hyprland IPC is not available
+
+[languages]
+enabled = ["en", "ru"]
+
+[dictionaries]
+# English: hunspell-en_us ships en_US-large.dic alongside en_US.dic — the
+# large variant has ~125k base forms vs ~50k. English has minimal inflection
+# so base-form lookup is fine.
+en = "/usr/share/hunspell/en_US-large.dic"
+# Russian: Hunspell .dic files store only lemmas; without affix expansion
+# inflected forms (cases, tenses, gender) miss. Instead: top-200k frequency
+# list from FrequencyWords (OpenSubtitles-2018, already inflected) merged
+# with a curated supplement (post-2018 vocabulary, IT-jargon inflections).
+# Run `dist/fetch-dicts.sh` to install. $HOME is substituted by install.sh.
+ru = "$HOME/.local/share/swtchr/dicts/ru_top200k.txt"
+extra_words = ["systemd", "tmux", "swtchr", "hyprland"]
+
+[detector]
+min_word_len = 3
+min_score_delta = 1.5
+blacklist = ["a", "i", "и", "в", "на"]
+fallback_unicode_input = false
+
+[devices]
+ignore = []                     # device names from `ls /dev/input/by-id/`
+also_watch_mice = true          # not yet implemented; reserved

@@ -1,0 +1,17 @@
+[Unit]
+Description=swtchr — keyboard layout autoswitcher (en/ru) for Hyprland
+Documentation=https://github.com/glafeara/swtchr
+After=graphical-session.target
+PartOf=graphical-session.target
+ConditionEnvironment=HYPRLAND_INSTANCE_SIGNATURE
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/swtchr
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+Environment=RUST_LOG=swtchr=info
+
+[Install]
+WantedBy=graphical-session.target

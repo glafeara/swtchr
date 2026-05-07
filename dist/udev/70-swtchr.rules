@@ -1,0 +1,6 @@
+# /dev/uinput access for the local user via the `input` group.
+# /dev/input/event* is already group-owned by `input` on stock Arch; the
+# second line below is a belt-and-braces guard for distros that ship 0600.
+
+KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"
+SUBSYSTEM=="input", KERNEL=="event*", MODE="0640", GROUP="input"
