@@ -5,4 +5,4 @@ pub mod state;
 
 pub use detector::{Verdict, classify};
 pub use dict::{Dict, HunspellDict};
-pub use state::{CoreState, ModState, PrevToken, WordBuffer, WordEntry};
+pub use state::{CoreState, MAX_PREV_TOKENS, ModState, PrevToken, WordBuffer, WordEntry};

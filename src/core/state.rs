@@ -1,7 +1,13 @@
 //! In-memory state owned by the service: word buffer, layout index,
 //! modifier tracker.
 
+use std::collections::VecDeque;
 use std::time::Instant;
+
+/// Cap on the retro-fix queue. Three covers chains like "а ты не [longword]"
+/// or "и в [longword]" — most natural phrase openings stay under this. Beyond
+/// it, the oldest entry gets evicted (likely outside the retro window anyway).
+pub const MAX_PREV_TOKENS: usize = 3;
 
 /// One key the user typed that contributed a character to the current word.
 /// Stores the raw evdev keycode (so we can replay positionally after a layout
@@ -107,13 +113,13 @@ impl ModState {
 }
 
 /// A finished word that the detector chose not to act on, kept around so a
-/// later mislayout-trigger on the *next* word can retroactively fix it too.
+/// later mislayout-trigger on a following word can retroactively fix it too.
 ///
-/// Use case: user types "d ghbdtn " (intending "в привет ") in EN. The "d"
-/// finishes as Unknown (1 char, below dict-path floor). The "ghbdtn" finishes
-/// as MisLayout. Without this snapshot, only "ghbdtn" is converted and "d"
-/// stays orphaned in the wrong layout. With it, we backspace through both
-/// tokens and replay them through the new layout.
+/// Use case: user types "f ns gbitim " (intending "а ты пишешь ") in EN.
+/// "f" finishes as Unknown (1 char). "ns" finishes as MisLayout (dict hit on
+/// "ты"), but only "ns" + the running word would be converted unless we kept
+/// a queue. With a queue: when MisLayout fires we drain all eligible recent
+/// short tokens and replay them through the new layout in chronological order.
 #[derive(Debug, Clone)]
 pub struct PrevToken {
     pub entries: Vec<WordEntry>,
@@ -130,12 +136,20 @@ pub struct CoreState {
     pub last_event_at: Option<Instant>,
     pub replaying: bool,
     pub seq: u64,
-    pub prev_token: Option<PrevToken>,
+    pub prev_tokens: VecDeque<PrevToken>,
 }
 
 impl CoreState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Push a retro-fix candidate, evicting the oldest entry past the cap.
+    pub fn push_prev_token(&mut self, t: PrevToken) {
+        self.prev_tokens.push_back(t);
+        while self.prev_tokens.len() > MAX_PREV_TOKENS {
+            self.prev_tokens.pop_front();
+        }
     }
 }
 
@@ -158,5 +172,34 @@ mod tests {
         let mut m = ModState::default();
         assert!(!m.update(30, true)); // KEY_A
         assert!(!m.shift());
+    }
+
+    fn make_token(ch: char) -> PrevToken {
+        PrevToken {
+            entries: vec![WordEntry {
+                ch,
+                keycode: 30,
+                shift: false,
+            }],
+            boundary_kc: 57,
+            finished_at: Instant::now(),
+            layout_idx_when_typed: 0,
+        }
+    }
+
+    #[test]
+    fn prev_tokens_queue_caps_and_evicts_oldest() {
+        let mut s = CoreState::new();
+        for ch in ['a', 'b', 'c', 'd'] {
+            s.push_prev_token(make_token(ch));
+        }
+        assert_eq!(s.prev_tokens.len(), MAX_PREV_TOKENS);
+        // 'a' was evicted; queue holds b, c, d in order.
+        let chs: Vec<char> = s
+            .prev_tokens
+            .iter()
+            .map(|t| t.entries[0].ch)
+            .collect();
+        assert_eq!(chs, vec!['b', 'c', 'd']);
     }
 }

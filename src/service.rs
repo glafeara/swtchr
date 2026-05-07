@@ -191,7 +191,7 @@ impl Service {
             }
             CoreMsg::Hypr(HyprEvent::ActiveWindow) => {
                 self.state.buffer.clear();
-                self.state.prev_token = None;
+                self.state.prev_tokens.clear();
                 Ok(())
             }
             CoreMsg::SwapSelection => self.swap_selection().await,
@@ -213,17 +213,20 @@ impl Service {
 
     async fn handle_key(&mut self, ev: KeyEvent) -> Result<()> {
         let now = Instant::now();
-        // Idle-reset: if the previous event was long enough ago, the user has
-        // moved on (paste, focus change, mouse selection) — drop any partial
-        // word and any retro-fix candidate so we don't act on stale state.
+        // Idle-reset: if the previous event was long enough ago, the user
+        // has moved on (paste, focus change, mouse selection) — drop any
+        // partial word so we don't act on stale state. We deliberately do
+        // NOT touch prev_tokens here: each entry has its own
+        // `retro_window_ms` check inside `auto_replay`, which is the right
+        // gate for retro-fix eligibility. Clipping the queue at the shorter
+        // `idle_reset_ms` would silently break the "type a 1-char prep,
+        // pause, type the rest" flow that the retro window is meant to
+        // tolerate.
         if let Some(prev) = self.state.last_event_at {
             let idle = Duration::from_millis(self.cfg.general.idle_reset_ms);
-            if now.duration_since(prev) > idle {
-                if !self.state.buffer.is_empty() {
-                    debug!("idle reset: clearing buffer");
-                    self.state.buffer.clear();
-                }
-                self.state.prev_token = None;
+            if now.duration_since(prev) > idle && !self.state.buffer.is_empty() {
+                debug!("idle reset: clearing buffer");
+                self.state.buffer.clear();
             }
         }
         self.state.last_event_at = Some(now);
@@ -247,7 +250,7 @@ impl Service {
         if self.state.mods.any_command_modifier() {
             if !is_mod {
                 self.state.buffer.clear();
-                self.state.prev_token = None;
+                self.state.prev_tokens.clear();
             }
             return Ok(());
         }
@@ -261,7 +264,7 @@ impl Service {
         // motion means the upcoming text is unrelated to what we just typed.
         if decoded.is_navigation {
             self.state.buffer.clear();
-            self.state.prev_token = None;
+            self.state.prev_tokens.clear();
             return Ok(());
         }
 
@@ -369,8 +372,9 @@ impl Service {
     /// current-layout text plus this letter is a complete word in the
     /// current dict — that's the signal to keep typing instead of firing a
     /// boundary. Partial words ("лю" mid-"люблю") look the same as gibberish
-    /// here, but a wrong boundary just clears the buffer; the detector
-    /// won't act on a sub-min_word_len token, so no spurious swap occurs.
+    /// here, but a wrong boundary just clears the buffer; the swap form would
+    /// contain `.` (a non-letter) which won't appear in any dict, so no
+    /// spurious swap fires.
     fn letter_completes_current_lang_word(&self, ch: char) -> bool {
         if self.state.buffer.is_empty() {
             return false;
@@ -426,7 +430,6 @@ impl Service {
             other_dict,
             &cur_lang,
             &other_lang,
-            self.cfg.detector.min_word_len,
             self.cfg.detector.min_score_delta,
         );
 
@@ -445,11 +448,13 @@ impl Service {
                 self.auto_replay(entries, boundary_kc).await?;
             }
             Verdict::Unknown if was_short => {
-                // Stash for a possible retro-fix when the next word fires
+                // Stash for a possible retro-fix when a following word fires
                 // MisLayout. We only stash short Unknowns because they're the
                 // ones the dict path deliberately abstained on; longer
-                // Unknowns are likely intentional gibberish.
-                self.state.prev_token = Some(PrevToken {
+                // Unknowns are likely intentional gibberish. The queue caps at
+                // MAX_PREV_TOKENS so chains like "а ты не [longword]" all flow
+                // through retro-fix together.
+                self.state.push_prev_token(PrevToken {
                     entries,
                     boundary_kc,
                     finished_at: Instant::now(),
@@ -459,8 +464,10 @@ impl Service {
             }
             _ => {
                 // Ok, or Unknown on a non-short word — neither qualifies as
-                // a retro-fix candidate.
-                self.state.prev_token = None;
+                // a retro-fix candidate, and a non-short Unknown breaks the
+                // chain (the user wrote something we can't classify either way,
+                // so we don't trust earlier short tokens to belong with it).
+                self.state.prev_tokens.clear();
                 self.state.buffer.clear();
             }
         }
@@ -469,10 +476,10 @@ impl Service {
 
     /// Convert a word to the other layout: BS through the typed text + its
     /// boundary, switch layout, replay through the new layout, re-emit the
-    /// boundary key. If a recent short token sat in the same wrong layout
-    /// (`prev_token`), include it in the same backspace sweep so it gets
-    /// fixed too — addresses the "preposition stays in the wrong layout"
-    /// case where users start a phrase with a 1–2 char Russian preposition.
+    /// boundary key. Recent short tokens sitting in the same wrong layout
+    /// (`prev_tokens` queue) get included in the same backspace sweep —
+    /// addresses the "preposition stays in the wrong layout" case where users
+    /// start a phrase with one or more 1–2 char Russian function words.
     async fn auto_replay(&mut self, entries: Vec<WordEntry>, boundary_kc: u32) -> Result<()> {
         let cur_idx = self.xkb.active_index();
         let n_layouts = self.xkb.layouts().len() as u32;
@@ -482,15 +489,21 @@ impl Service {
             0
         };
 
-        let prev = self.state.prev_token.take().filter(|p| {
-            let age = Instant::now().saturating_duration_since(p.finished_at);
-            age < Duration::from_millis(self.cfg.detector.retro_window_ms)
-                && p.layout_idx_when_typed == cur_idx
-        });
+        // Drain the queue and keep only entries that are recent enough and
+        // were typed in the same (current) layout. Order is preserved.
+        let now = Instant::now();
+        let window = Duration::from_millis(self.cfg.detector.retro_window_ms);
+        let prevs: Vec<PrevToken> = std::mem::take(&mut self.state.prev_tokens)
+            .into_iter()
+            .filter(|p| {
+                now.saturating_duration_since(p.finished_at) < window
+                    && p.layout_idx_when_typed == cur_idx
+            })
+            .collect();
 
         let n = entries.len();
-        let prev_count = prev.as_ref().map(|p| p.entries.len() + 1).unwrap_or(0);
-        let total_bs = prev_count + n + 1;
+        let prev_chars: usize = prevs.iter().map(|p| p.entries.len() + 1).sum();
+        let total_bs = prev_chars + n + 1;
 
         self.state.replaying = true;
 
@@ -499,7 +512,7 @@ impl Service {
             HyprIpc::switch_layout_to(target_idx).await?;
             sleep(Duration::from_millis(40)).await;
 
-            if let Some(p) = &prev {
+            for p in &prevs {
                 self.injector.replay_entries(&p.entries).await?;
                 let pb = u16::try_from(p.boundary_kc).map_err(|_| {
                     crate::error::Error::Evdev(format!(
@@ -540,8 +553,8 @@ impl Service {
 
         self.state.replaying = false;
         self.state.buffer.clear();
-        let with_prev = prev.is_some();
-        info!(n, with_prev, "auto-converted word in switched layout");
+        let prev_count = prevs.len();
+        info!(n, prev_count, "auto-converted word in switched layout");
         Ok(())
     }
 
@@ -550,7 +563,7 @@ impl Service {
     /// action and should override pending auto-detection state.
     pub async fn swap_selection(&mut self) -> Result<()> {
         self.state.buffer.clear();
-        self.state.prev_token = None;
+        self.state.prev_tokens.clear();
 
         // wlroots aggregates modifier state across all keyboards in the seat,
         // so any letter we inject while the trigger's modifier (Super/Ctrl/Alt)
@@ -606,7 +619,7 @@ impl Service {
                     // Same as the regular handler: focus changed, drop stale
                     // word state. Cheap to apply mid-wait.
                     self.state.buffer.clear();
-                    self.state.prev_token = None;
+                    self.state.prev_tokens.clear();
                 }
                 Ok(CoreMsg::SwapSelection) => {
                     // Re-entrant swap requested while we're already mid-wait.
