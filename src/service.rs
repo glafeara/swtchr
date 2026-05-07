@@ -502,6 +502,18 @@ impl Service {
     pub async fn swap_selection(&mut self) -> Result<()> {
         self.state.buffer.clear();
         self.state.prev_token = None;
+
+        // wlroots aggregates modifier state across all keyboards in the seat,
+        // so any letter we inject while the trigger's modifier (Super/Ctrl/Alt)
+        // is still physically held will combine with that modifier and may
+        // match a Hyprland keybind — e.g. an injected `s` becomes `SUPER+s` and
+        // tosses the focused window into a special workspace. Releasing the
+        // modifier on our virtual keyboard does *not* cancel the real one.
+        // Wait for the user to lift the modifier (with a short safety cap) and
+        // pump the channel so ModState actually advances during the wait.
+        self.wait_for_modifier_release(Duration::from_millis(400))
+            .await;
+
         self.state.replaying = true;
         let res = crate::selection::swap_selection(
             &mut self.xkb,
@@ -515,6 +527,64 @@ impl Service {
             self.state.layout_idx = self.xkb.active_index();
         }
         res
+    }
+
+    /// Block until no command modifier (Ctrl/Alt/Super) is held, or `max_wait`
+    /// elapses. The service main loop is single-threaded — we *must* drain the
+    /// pending channel ourselves while we wait, otherwise the release event
+    /// sits in the queue and `state.mods` never advances.
+    async fn wait_for_modifier_release(&mut self, max_wait: Duration) {
+        if !self.state.mods.any_command_modifier() {
+            return;
+        }
+        let started = Instant::now();
+        let deadline = started + max_wait;
+        loop {
+            match self.rx.try_recv() {
+                Ok(CoreMsg::Key(ev)) => {
+                    let pressed = matches!(ev.kind, KeyKind::Press);
+                    if matches!(ev.kind, KeyKind::Press | KeyKind::Release) {
+                        self.state.mods.update(ev.keycode, pressed);
+                    }
+                }
+                Ok(CoreMsg::Hypr(HyprEvent::ActiveLayout { layout_name, .. })) => {
+                    if let Some(idx) = layout_index(&self.xkb, &layout_name) {
+                        self.xkb.set_active_layout(idx);
+                        self.state.layout_idx = idx;
+                    }
+                }
+                Ok(CoreMsg::Hypr(HyprEvent::ActiveWindow)) => {
+                    // Same as the regular handler: focus changed, drop stale
+                    // word state. Cheap to apply mid-wait.
+                    self.state.buffer.clear();
+                    self.state.prev_token = None;
+                }
+                Ok(CoreMsg::SwapSelection) => {
+                    // Re-entrant swap requested while we're already mid-wait.
+                    // Drop it — the in-flight swap will pick up whatever is
+                    // selected when it actually fires.
+                    debug!("dropping reentrant swap request during modifier wait");
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return,
+            }
+            if !self.state.mods.any_command_modifier() {
+                debug!(
+                    waited_ms = started.elapsed().as_millis() as u64,
+                    "swap: modifier released"
+                );
+                return;
+            }
+            if Instant::now() >= deadline {
+                warn!(
+                    waited_ms = started.elapsed().as_millis() as u64,
+                    "swap: modifier still held; injecting anyway (may trigger Hyprland binds)"
+                );
+                return;
+            }
+        }
     }
 }
 

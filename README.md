@@ -155,6 +155,16 @@ You're not in the `input` group, or the udev rule didn't apply. Run
 `sudo udevadm control --reload && sudo udevadm trigger --name-match=uinput`,
 or re-run `dist/install.sh`.
 
+**Selection swap throws the window into the scratchpad / triggers other Hyprland binds.**
+The hotkey you bound to `swtchr swap` (e.g. `SUPER, BackSlash`) holds a
+modifier. wlroots aggregates modifier state across every keyboard in the
+seat, so any letter swtchr injects via uinput while you still physically
+hold Super combines into `SUPER+<letter>` and matches your binds. swtchr
+waits for the modifier to be released before injecting (up to 400ms);
+if the daemon isn't running the latest build, rebuild and restart with
+`./dist/install.sh`. If you have a habit of holding the trigger longer,
+release it as soon as the bind fires.
+
 **Replay produces wrong characters.**
 The xkb layout list reported by `hyprctl getoption input:kb_layout` must match
 what's in `[general] default_layout`. swtchr trusts Hyprland and queries it on
