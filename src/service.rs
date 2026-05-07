@@ -39,6 +39,17 @@ fn is_punct_char(s: &str) -> bool {
     matches!(s, "." | "," | ";" | ":" | "!" | "?" | "'" | "\"")
 }
 
+/// Punct-position keycodes that produce a *letter* in RU JCUKEN (and so
+/// `is_punct_char` on the decoded UTF-8 misses them). Without this, typing a
+/// URL like `github.com` while RU is active stays as one buffered token —
+/// `KEY_DOT` outputs «ю», never triggers a boundary, never reaches the
+/// detector. KEY_SLASH is excluded: it produces "/" in EN and "." in RU,
+/// both already real punctuation handled by `is_punct_char`.
+fn is_punct_keycode(kc: u32) -> bool {
+    // KEY_SEMICOLON=39, KEY_APOSTROPHE=40, KEY_COMMA=51, KEY_DOT=52
+    matches!(kc, 39 | 40 | 51 | 52)
+}
+
 /// Map Hyprland's `activelayout` payload (e.g. "English (US)" or "Russian")
 /// back to a layout *index* in our xkb keymap. The names are the canonical
 /// xkb names from `evdev.lst`.
@@ -286,6 +297,26 @@ impl Service {
                 }
                 return self.on_word_boundary(ev.keycode).await;
             }
+            // Punct-position keycode that produced a letter in the current
+            // layout (RU's `.`→ю etc.). If buffer+letter is a real word in
+            // the *current* dict, treat it as legit typing and push. Otherwise
+            // assume the keycode is real punctuation in the user's intended
+            // layout (URL case: `github` typed as `пшерги` then `.`/ю) and
+            // fire a boundary so the detector sees the buffer.
+            if is_punct_keycode(ev.keycode)
+                && let Some(ch) = s.chars().next()
+                && !ch.is_control()
+            {
+                if self.letter_completes_current_lang_word(ch) {
+                    self.state.buffer.push(WordEntry {
+                        ch,
+                        keycode: ev.keycode,
+                        shift: self.state.mods.shift(),
+                    });
+                    return Ok(());
+                }
+                return self.on_word_boundary(ev.keycode).await;
+            }
             if let Some(ch) = s.chars().next()
                 && !ch.is_control()
             {
@@ -330,6 +361,24 @@ impl Service {
             return false;
         };
         self.dict_for_layout(other_idx).lookup(&swapped)
+    }
+
+    /// Mirror of `punct_completes_other_lang_word` for the asymmetric case
+    /// where a punct-position keycode produces a *letter* in the current
+    /// layout (RU `.`→ю etc.). Returns true only when the buffer's
+    /// current-layout text plus this letter is a complete word in the
+    /// current dict — that's the signal to keep typing instead of firing a
+    /// boundary. Partial words ("лю" mid-"люблю") look the same as gibberish
+    /// here, but a wrong boundary just clears the buffer; the detector
+    /// won't act on a sub-min_word_len token, so no spurious swap occurs.
+    fn letter_completes_current_lang_word(&self, ch: char) -> bool {
+        if self.state.buffer.is_empty() {
+            return false;
+        }
+        let mut text: String = self.state.buffer.text();
+        text.push(ch);
+        let cur_idx = self.xkb.active_index();
+        self.dict_for_layout(cur_idx).lookup(&text)
     }
 
     /// Word-boundary handling: runs the detector and converts on MisLayout.
@@ -605,6 +654,24 @@ mod tests {
         assert!(is_punct_char("."));
         assert!(is_punct_char(","));
         assert!(!is_punct_char("a"));
+    }
+
+    #[test]
+    fn punct_keycodes_cover_ru_letter_positions() {
+        // KEY_DOT/COMMA/SEMICOLON/APOSTROPHE produce letters in RU JCUKEN
+        // and so escape `is_punct_char`. They must still be recognised as
+        // boundary candidates by keycode.
+        assert!(is_punct_keycode(39)); // ; / ж
+        assert!(is_punct_keycode(40)); // ' / э
+        assert!(is_punct_keycode(51)); // , / б
+        assert!(is_punct_keycode(52)); // . / ю
+        // Letter keys must not be treated as punct positions.
+        assert!(!is_punct_keycode(30)); // KEY_A
+        assert!(!is_punct_keycode(57)); // KEY_SPACE — handled as boundary keycode separately
+        // KEY_SLASH outputs real punct in both layouts; the existing
+        // `is_punct_char` branch handles RU's ".", and EN's "/" is left as
+        // a regular character on purpose.
+        assert!(!is_punct_keycode(53));
     }
 
     #[test]
